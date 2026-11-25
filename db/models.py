@@ -1,0 +1,135 @@
+from datetime import datetime, timezone
+from sqlalchemy import Column, Integer, Float, Text, ForeignKey, DateTime, JSON, UniqueConstraint, Boolean
+from sqlalchemy.orm import DeclarativeBase, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Professor(Base):
+    __tablename__ = "professors"
+
+    id = Column(Integer, primary_key=True)
+    name_nexus = Column(Text)
+    name_rmp = Column(Text)
+    rmp_id = Column(Integer, unique=True, nullable=True)
+    department = Column(Text)
+    match_confidence = Column(Float, nullable=True)
+
+    grades = relationship("GradeDistribution", back_populates="professor")
+    rmp_ratings = relationship("RmpRating", back_populates="professor")
+    scores = relationship("GauchoScore", back_populates="professor")
+    scheduled_sections = relationship("ScheduledSection", back_populates="professor")
+
+
+class Course(Base):
+    __tablename__ = "courses"
+
+    id = Column(Integer, primary_key=True)
+    code = Column(Text, unique=True, nullable=False)
+    title = Column(Text, nullable=True)
+    department = Column(Text)
+
+    grades = relationship("GradeDistribution", back_populates="course")
+    scores = relationship("GauchoScore", back_populates="course")
+    scheduled_sections = relationship("ScheduledSection", back_populates="course")
+
+
+class GradeDistribution(Base):
+    __tablename__ = "grade_distributions"
+
+    id = Column(Integer, primary_key=True)
+    professor_id = Column(Integer, ForeignKey("professors.id"), nullable=False, index=True)
+    course_id = Column(Integer, ForeignKey("courses.id"), nullable=False, index=True)
+    quarter = Column(Text, nullable=False)
+    year = Column(Integer, nullable=False)
+    a_plus = Column(Integer, default=0)
+    a = Column(Integer, default=0)
+    a_minus = Column(Integer, default=0)
+    b_plus = Column(Integer, default=0)
+    b = Column(Integer, default=0)
+    b_minus = Column(Integer, default=0)
+    c_plus = Column(Integer, default=0)
+    c = Column(Integer, default=0)
+    c_minus = Column(Integer, default=0)
+    d_plus = Column(Integer, default=0)
+    d = Column(Integer, default=0)
+    d_minus = Column(Integer, default=0)
+    f = Column(Integer, default=0)
+    avg_gpa = Column(Float)
+
+    professor = relationship("Professor", back_populates="grades")
+    course = relationship("Course", back_populates="grades")
+
+
+class RmpRating(Base):
+    __tablename__ = "rmp_ratings"
+
+    id = Column(Integer, primary_key=True)
+    professor_id = Column(Integer, ForeignKey("professors.id"), nullable=False, index=True)
+    overall_quality = Column(Float)
+    difficulty = Column(Float)
+    would_take_again_pct = Column(Float, nullable=True)
+    num_ratings = Column(Integer)
+    fetched_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    professor = relationship("Professor", back_populates="rmp_ratings")
+    comments = relationship("RmpComment", back_populates="rating")
+
+
+class RmpComment(Base):
+    __tablename__ = "rmp_comments"
+
+    id = Column(Integer, primary_key=True)
+    rmp_rating_id = Column(Integer, ForeignKey("rmp_ratings.id"), nullable=False, index=True)
+    comment_text = Column(Text)
+    sentiment_score = Column(Float, nullable=True)
+    keywords = Column(JSON, nullable=True)
+    created_at = Column(DateTime, nullable=True)
+
+    rating = relationship("RmpRating", back_populates="comments")
+
+
+class GauchoScore(Base):
+    __tablename__ = "gaucho_scores"
+    __table_args__ = (
+        UniqueConstraint("professor_id", "course_id", name="uq_gaucho_score_pair"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    professor_id = Column(Integer, ForeignKey("professors.id"), nullable=False, index=True)
+    course_id = Column(Integer, ForeignKey("courses.id"), nullable=False, index=True)
+    score = Column(Float)
+    weights_used = Column(JSON)
+    computed_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    professor = relationship("Professor", back_populates="scores")
+    course = relationship("Course", back_populates="scores")
+
+
+class ScheduledSection(Base):
+    __tablename__ = "scheduled_sections"
+    __table_args__ = (
+        UniqueConstraint("quarter_code", "enroll_code", name="uq_scheduled_section_quarter_enroll"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    professor_id = Column(Integer, ForeignKey("professors.id"), nullable=True, index=True)
+    course_id = Column(Integer, ForeignKey("courses.id"), nullable=True, index=True)
+    quarter_code = Column(Text, nullable=False, index=True)  # e.g. "20262"
+    quarter_name = Column(Text, nullable=True)    # e.g. "Spring 2026"
+    enroll_code = Column(Text, nullable=False)     # UCSB enrollment code
+    instructor_name_raw = Column(Text, nullable=True)  # e.g. "CONRAD P T" — preserved for debugging
+    days = Column(Text, nullable=True)             # e.g. "T R"
+    begin_time = Column(Text, nullable=True)       # e.g. "14:00"
+    end_time = Column(Text, nullable=True)         # e.g. "15:15"
+    building = Column(Text, nullable=True)
+    room = Column(Text, nullable=True)
+    enrolled = Column(Integer, nullable=True)
+    max_enroll = Column(Integer, nullable=True)
+    section_cancelled = Column(Boolean, default=False)
+    fetched_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    professor = relationship("Professor", back_populates="scheduled_sections")
+    course = relationship("Course", back_populates="scheduled_sections")

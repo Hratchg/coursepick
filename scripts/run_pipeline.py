@@ -1,0 +1,110 @@
+"""One-shot CLI script to run the full Gaucho pipeline.
+
+Usage:
+    python scripts/run_pipeline.py              # full pipeline
+    python scripts/run_pipeline.py --scrape     # scrape only
+    python scripts/run_pipeline.py --match      # enhanced matching only
+    python scripts/run_pipeline.py --nlp        # NLP only
+    python scripts/run_pipeline.py --score      # scoring only
+"""
+import argparse
+import logging
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from db.connection import get_session
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+def run_scrape(session):
+    from scrapers.targeted_scrape import scrape_active_professors
+    logger.info("=== Phase 1: Targeted RMP Scrape ===")
+    stats = scrape_active_professors(session, min_year=2023)
+    logger.info(f"Scrape complete: {stats}")
+    return stats
+
+
+def run_matching(session):
+    from etl.enhanced_matcher import run_enhanced_matching
+    logger.info("=== Phase 1.5: Enhanced Professor Matching ===")
+    stats = run_enhanced_matching(session, min_year=2023)
+    logger.info(f"Matching complete: {stats}")
+    return stats
+
+
+def run_nlp(session):
+    from etl.nlp_processor import process_all_comments
+    logger.info("=== Phase 2: NLP Processing ===")
+    stats = process_all_comments(session)
+    logger.info(f"NLP complete: {stats}")
+    return stats
+
+
+def run_keyword_backfill(session):
+    from etl.nlp_processor import backfill_keywords
+    logger.info("=== Maintenance: Keyword Backfill ===")
+    stats = backfill_keywords(session)
+    logger.info(f"Backfill complete: {stats}")
+    return stats
+
+
+def run_scoring(session):
+    from etl.scoring import compute_all_scores
+    logger.info("=== Phase 3: Gaucho Score Computation ===")
+    stats = compute_all_scores(session)
+    logger.info(f"Scoring complete: {stats}")
+    return stats
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run the Gaucho Course Optimizer pipeline")
+    parser.add_argument("--scrape", action="store_true", help="Run RMP scrape only")
+    parser.add_argument("--match", action="store_true", help="Run enhanced matching only")
+    parser.add_argument("--nlp", action="store_true", help="Run NLP processing only")
+    parser.add_argument("--score", action="store_true", help="Run scoring only")
+    parser.add_argument(
+        "--backfill-keywords",
+        action="store_true",
+        help=(
+            "Recompute keywords for comments already processed under the old "
+            "single-row scheme (BUG-4). One-off maintenance; not part of --all."
+        ),
+    )
+    args = parser.parse_args()
+
+    run_all = not (
+        args.scrape or args.match or args.nlp or args.score or args.backfill_keywords
+    )
+
+    session = get_session()
+    try:
+        if args.backfill_keywords:
+            run_keyword_backfill(session)
+        if run_all or args.scrape:
+            run_scrape(session)
+        if run_all or args.match:
+            run_matching(session)
+        if run_all or args.nlp:
+            run_nlp(session)
+        if run_all or args.score:
+            run_scoring(session)
+
+        logger.info("Pipeline finished.")
+    except KeyboardInterrupt:
+        logger.info("Pipeline interrupted. Partial progress is saved.")
+    finally:
+        session.close()
+
+
+if __name__ == "__main__":
+    main()

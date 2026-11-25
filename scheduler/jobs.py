@@ -1,0 +1,214 @@
+import logging
+from dotenv import load_dotenv
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+RMP_REFRESH_JOB_ID = "rmp_targeted_refresh"
+QUARTERLY_JOB_ID = "quarterly_grade_update"
+SCHEDULE_REFRESH_JOB_ID = "nightly_schedule_refresh"
+
+
+def rmp_targeted_refresh():
+    """Targeted RMP scrape -> enhanced matching -> NLP -> recompute scores.
+
+    Matching runs link-only (passes 1-3). Pass 4, which merges duplicate
+    professors by deleting rows, is left out because nobody reviews this run
+    and a wrong merge can't be undone without a backup; run it by hand via
+    the "Enhanced professor matching" workflow. Every new link is logged with
+    the professor id, so this job's log is the review trail.
+
+    Raises if any step fails or the scrape gave up on RMP, so the weekly
+    GitHub Actions job goes red instead of logging and exiting 0. A matching
+    failure skips NLP and scoring. An aborted scrape still runs matching, NLP
+    and scoring over whatever it saved first. Under APScheduler the exception
+    is just logged.
+    """
+    logger.info("Starting targeted RMP refresh...")
+    from scrapers.targeted_scrape import scrape_active_professors
+    from etl.enhanced_matcher import run_enhanced_matching
+    from etl.nlp_processor import process_all_comments
+    from etl.scoring import compute_all_scores
+    from db.connection import get_session
+
+    session = get_session()
+    try:
+        scrape_stats = scrape_active_professors(session, min_year=2023)
+        logger.info(f"Scrape: {scrape_stats}")
+
+        match_stats = run_enhanced_matching(
+            session, min_year=2023, merge_duplicates=False
+        )
+        logger.info(
+            f"Matching: {match_stats['total_new_matches']} new RMP links "
+            f"(pass 1: {match_stats['pass1']['matched']}, "
+            f"pass 2: {match_stats['pass2']['matched']}, "
+            f"pass 3: {match_stats['pass3']['matched']}); "
+            f"duplicate merging skipped. Details: {match_stats}"
+        )
+
+        nlp_stats = process_all_comments(session)
+        logger.info(f"NLP: {nlp_stats}")
+
+        score_stats = compute_all_scores(session)
+        logger.info(f"Scoring: {score_stats}")
+    except Exception as e:
+        logger.error(f"RMP refresh failed: {e}")
+        raise
+    finally:
+        session.close()
+
+    if scrape_stats.get("aborted"):
+        raise RuntimeError(
+            f"RMP scrape stopped after consecutive search errors: {scrape_stats}"
+        )
+
+
+def quarterly_grade_update():
+    """Quarterly job: fetch the Daily Nexus grades CSV -> load new rows.
+
+    Raises if the fetch or the load fails, so the quarterly GitHub Actions job
+    goes red instead of logging and exiting 0. Under APScheduler the exception
+    is just logged.
+
+    No score recompute here: the API scores professors live from
+    grade_distributions, and nothing reads the gaucho_scores table, which the
+    weekly RMP refresh rewrites anyway. That refresh also picks up professors
+    this load creates (anyone with grades since 2023) and searches RMP for them.
+    """
+    logger.info("Starting quarterly grade update...")
+    from scrapers.grades_ingester import fetch_grades_csv
+    from scrapers.grades_loader import load_grades_to_db
+    from db.connection import get_session
+
+    session = get_session()
+    try:
+        df = fetch_grades_csv()
+        rows = df.to_dict("records")
+        inserted = load_grades_to_db(rows, session)
+        logger.info(f"Loaded {inserted} new grade records")
+    except Exception as e:
+        logger.error(f"Quarterly grade update failed: {e}")
+        raise
+    finally:
+        session.close()
+
+
+def nightly_schedule_refresh():
+    """Nightly job: fetch the current and next quarter schedules for all departments.
+
+    Raises if the refresh could not run or any department failed for a reason
+    other than the UCSB API, so the GitHub Actions job goes red instead of
+    logging and exiting 0. Under APScheduler the exception is just logged.
+
+    The next quarter is probed first (see ``is_quarter_published``) and
+    skipped with one INFO line while UCSB hasn't published it, rather than
+    sending a request and logging two ERRORs for every department. The
+    current quarter is never probed or skipped: if UCSB rejects it, every
+    department still logs its ERROR, because that is a real problem.
+    """
+    logger.info("Starting nightly schedule refresh...")
+    from db.connection import get_session
+    from db.queries import get_departments
+    from ucsb_api.client import UCSBApiClient
+    from ucsb_api.quarters import current_and_next_quarter_codes
+    from ucsb_api.schedule_sync import (
+        backfill_missing_titles,
+        is_quarter_published,
+        sync_department_sections,
+    )
+
+    session = get_session()
+    failed: list[str] = []  # "DEPT/quarter" for each sync that raised
+    try:
+        client = UCSBApiClient()
+        current_qcode, next_qcode = current_and_next_quarter_codes()
+
+        departments = get_departments(session)
+        total_stats = {"inserted": 0, "updated": 0, "matched": 0, "auto_created": 0}
+        auto_create_cache: dict[str, int] = {}  # shared across all departments
+
+        # Sync both current and next quarter so students always see data
+        for qcode in [current_qcode, next_qcode]:
+            if (
+                qcode == next_qcode
+                and departments
+                and not is_quarter_published(
+                    client, qcode, reference_quarter=current_qcode, department=departments[0]
+                )
+            ):
+                logger.info(
+                    f"Quarter {qcode} not published yet; skipping "
+                    f"(UCSB rejects {departments[0]} for {qcode} but not for {current_qcode})"
+                )
+                continue
+            logger.info(f"Syncing quarter {qcode}...")
+            for dept in departments:
+                try:
+                    stats = sync_department_sections(
+                        session, qcode, dept, client=client,
+                        auto_create_cache=auto_create_cache,
+                    )
+                    for key in total_stats:
+                        total_stats[key] += stats.get(key, 0)
+                except Exception as e:
+                    # UCSB API errors are handled inside sync_department_sections,
+                    # so anything landing here is a DB error or a bug: keep going
+                    # for the other departments, but fail the run at the end.
+                    logger.error(f"Failed to sync department {dept} for {qcode}: {e}")
+                    session.rollback()
+                    failed.append(f"{dept}/{qcode}")
+
+        title_stats = backfill_missing_titles(session, current_qcode, client=client)
+        logger.info(f"Title backfill: {title_stats}")
+        logger.info(f"Schedule refresh complete: {total_stats}")
+    except Exception as e:
+        logger.error(f"Schedule refresh failed: {e}")
+        raise
+    finally:
+        session.close()
+
+    if failed:
+        raise RuntimeError(
+            f"Schedule refresh failed for {len(failed)} department sync(s): {', '.join(failed)}"
+        )
+
+
+def create_scheduler(start: bool = True) -> BlockingScheduler:
+    """Create and optionally start the APScheduler."""
+    scheduler = BlockingScheduler()
+
+    scheduler.add_job(
+        rmp_targeted_refresh,
+        trigger=CronTrigger(day="*/2", hour=2, minute=0),
+        id=RMP_REFRESH_JOB_ID,
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        quarterly_grade_update,
+        trigger=CronTrigger(month="1,4,7,10", day=25, hour=3),
+        id=QUARTERLY_JOB_ID,
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        nightly_schedule_refresh,
+        trigger=CronTrigger(hour=1, minute=30),
+        id=SCHEDULE_REFRESH_JOB_ID,
+        replace_existing=True,
+    )
+
+    if start:
+        logger.info("Scheduler started.")
+        scheduler.start()
+
+    return scheduler
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    create_scheduler()

@@ -1,0 +1,138 @@
+import logging
+import time
+import random
+
+from db.models import Professor, RmpRating
+from scrapers.rmp_loader import get_active_professors, is_stale, load_rmp_teacher_to_db
+from scrapers.rmp_scraper import RmpScraper
+from etl.name_matcher import (
+    AUTO_MATCH_THRESHOLD,
+    normalize_nexus_name,
+    normalize_rmp_name,
+    match_confidence,
+)
+from etl.name_utils import given_name_conflict
+
+logger = logging.getLogger(__name__)
+
+
+def scrape_active_professors(
+    session,
+    scraper: RmpScraper | None = None,
+    min_year: int = 2023,
+    max_age_days: int = 2,
+    delay: float | None = None,
+    max_consecutive_errors: int = 10,
+) -> dict:
+    """Scrape RMP for active professors using targeted name search.
+
+    Stops early once max_consecutive_errors searches in a row have failed
+    (RMP blocking us or a bad token), rather than firing a request per
+    professor at an endpoint that is refusing them.
+
+    Returns stats dict: {searched, matched, skipped, already_fresh, errors, aborted}.
+    """
+    if scraper is None:
+        scraper = RmpScraper()
+
+    professors = get_active_professors(session, min_year=min_year)
+    total = len(professors)
+    # Store IDs upfront so rollbacks don't invalidate ORM objects
+    prof_ids = [(p.id, p.name_nexus) for p in professors]
+    session.expire_all()
+    stats = {
+        "searched": 0, "matched": 0, "skipped": 0, "already_fresh": 0, "errors": 0,
+        "aborted": False,
+    }
+    consecutive_errors = 0
+
+    for i, (prof_id, nexus_name) in enumerate(prof_ids):
+        # Check if data is already fresh
+        latest_rating = (
+            session.query(RmpRating)
+            .filter_by(professor_id=prof_id)
+            .order_by(RmpRating.fetched_at.desc())
+            .first()
+        )
+        fetched_at = latest_rating.fetched_at if latest_rating else None
+        if not is_stale(fetched_at, max_age_days=max_age_days):
+            stats["already_fresh"] += 1
+            continue
+
+        # Build search name from Nexus name
+        if not nexus_name:
+            stats["skipped"] += 1
+            continue
+
+        # Convert "LAST, FIRST" to "First Last" for RMP search
+        norm = normalize_nexus_name(nexus_name)
+        search_name = norm.title()
+
+        try:
+            results = scraper.search_teacher_by_name(search_name)
+            stats["searched"] += 1
+            consecutive_errors = 0
+        except Exception as e:
+            logger.error(f"[{i+1}/{total}] Error searching '{search_name}': {e}")
+            stats["errors"] += 1
+            consecutive_errors += 1
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error(
+                    f"Aborting scrape after {consecutive_errors} consecutive search errors"
+                )
+                stats["aborted"] = True
+                break
+            continue
+
+        # Fuzzy match against results. The score is dominated by the shared
+        # surname, so first drop profiles whose given name can't be this
+        # professor's (BERGSTROM R E vs "Ted Bergstrom" scores 85).
+        best_match = None
+        best_confidence = 0
+        for teacher in results:
+            if given_name_conflict(
+                nexus_name, teacher.get("first_name") or "", teacher.get("last_name") or ""
+            ):
+                continue
+            rmp_name = f"{teacher['first_name']} {teacher['last_name']}"
+            norm_rmp = normalize_rmp_name(rmp_name)
+            confidence = match_confidence(norm, norm_rmp)
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_match = teacher
+
+        # Only persist matches at or above AUTO_MATCH_THRESHOLD. The old
+        # "review" branch (70-84) wrote straight to production with no review
+        # queue, so weak matches (e.g. 73%) appeared as fact on course pages.
+        if best_match and best_confidence >= AUTO_MATCH_THRESHOLD:
+            try:
+                load_rmp_teacher_to_db(
+                    best_match, session,
+                    nexus_professor_id=prof_id,
+                    match_confidence=best_confidence,
+                )
+                stats["matched"] += 1
+                logger.info(
+                    f"[{i+1}/{total}] AUTO {nexus_name} -> "
+                    f"{best_match['first_name']} {best_match['last_name']} "
+                    f"({best_confidence}%)"
+                )
+            except Exception as e:
+                logger.error(f"[{i+1}/{total}] Error saving '{nexus_name}': {e}")
+                session.rollback()
+                stats["errors"] += 1
+        else:
+            stats["skipped"] += 1
+            logger.debug(
+                f"[{i+1}/{total}] SKIP {nexus_name} — "
+                f"best match: {best_confidence}% "
+                f"(need >= {AUTO_MATCH_THRESHOLD})"
+            )
+
+        # Rate limiting
+        if delay is None:
+            time.sleep(random.uniform(2, 4))
+        elif delay > 0:
+            time.sleep(delay)
+
+    return stats
